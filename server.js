@@ -4,9 +4,17 @@ const cors = require('cors');
 const Stripe = require('stripe');
 const admin = require('firebase-admin');
 
-// Initialize Firebase Admin SDK (to verify Firebase ID tokens)
+// Initialize Firebase Admin SDK from Base64 environment variable
+const serviceAccountBase64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+if (!serviceAccountBase64) {
+  console.error('❌ FIREBASE_SERVICE_ACCOUNT_BASE64 environment variable is missing');
+  process.exit(1);
+}
+const serviceAccountJson = Buffer.from(serviceAccountBase64, 'base64').toString('utf8');
+const serviceAccount = JSON.parse(serviceAccountJson);
+
 admin.initializeApp({
-  projectId: process.env.FIREBASE_PROJECT_ID,
+  credential: admin.credential.cert(serviceAccount),
 });
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
@@ -197,6 +205,22 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   res.json({ received: true });
 });
 
+
+// Simple root route for health checks
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    message: 'Stripe Connect backend is running',
+    endpoints: [
+      'POST /createConnectedAccount',
+      'POST /createAccountLink',
+      'POST /retrieveAccountStatus',
+      'POST /createPaymentIntent',
+      'GET /retrievePaymentIntent',
+      'POST /webhook'
+    ]
+  });
+});
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
