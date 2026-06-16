@@ -131,7 +131,7 @@ app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
     // Create a PaymentIntent on the connected account
     const paymentIntent = await stripe.paymentIntents.create(
       {
-        amount: amount, // already in cents/paisa
+        amount: amount,          // in cents/paisa
         currency: currency,
         payment_method_types: ['card'],
         transfer_data: {
@@ -153,6 +153,19 @@ app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating PaymentIntent:', error);
+
+    // Give a friendly error for "own account" issue
+    if (
+      error.message &&
+      error.message.includes('transfer_data[destination]') &&
+      error.message.includes('your own account')
+    ) {
+      return res.status(400).json({
+        message:
+          'The business has not set up a separate Stripe account. Please contact the business owner to complete their Stripe onboarding.',
+      });
+    }
+
     res.status(500).json({ message: error.message });
   }
 });
