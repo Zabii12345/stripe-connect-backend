@@ -4,23 +4,18 @@ const cors = require('cors');
 const Stripe = require('stripe');
 const admin = require('firebase-admin');
 
-// Initialize Firebase Admin SDK from Base64 environment variable
 const serviceAccountBase64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
 if (!serviceAccountBase64) {
   console.error('❌ FIREBASE_SERVICE_ACCOUNT_BASE64 environment variable is missing');
   process.exit(1);
 }
-const serviceAccountJson = Buffer.from(serviceAccountBase64, 'base64').toString('utf8');
-const serviceAccount = JSON.parse(serviceAccountJson);
+const serviceAccount = JSON.parse(Buffer.from(serviceAccountBase64, 'base64').toString('utf8'));
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
@@ -34,42 +29,37 @@ async function verifyFirebaseToken(req, res, next) {
   }
   const idToken = authHeader.split('Bearer ')[1];
   try {
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-    req.user = decodedToken;
+    req.user = await admin.auth().verifyIdToken(idToken);
     next();
   } catch (error) {
-    console.error('Token verification error:', error);
     return res.status(401).json({ error: 'Unauthorized: Invalid token' });
   }
 }
 
 // ============================================================
-// 1. Create a Stripe Connect Account (Express or Standard)
+// 1. Create a Stripe Express Connected Account
+//    (business user onboards their OWN Stripe account)
 // ============================================================
 app.post('/createConnectedAccount', verifyFirebaseToken, async (req, res) => {
   try {
     const { businessId, email, country = 'US' } = req.body;
 
-    // Create an Express account (simpler onboarding)
     const account = await stripe.accounts.create({
       type: 'express',
-      country: country,
-      email: email,
+      country,
+      email,
       capabilities: {
         card_payments: { requested: true },
         transfers: { requested: true },
       },
-      business_type: 'individual', // or 'company'
+      business_type: 'individual',
       business_profile: {
-        mcc: '5734', // Computer software stores (change as needed)
+        mcc: '7299', // Personal services (beauty, wellness, etc.)
         url: 'https://bookify.app',
       },
     });
 
     console.log(`✅ Created Stripe account ${account.id} for business ${businessId}`);
-
-    // Store the account ID in Firestore (you can do this from your Flutter app or here)
-    // We'll just return the accountId to the client
     res.json({ accountId: account.id });
   } catch (error) {
     console.error('Error creating connected account:', error);
@@ -104,11 +94,18 @@ app.post('/createAccountLink', verifyFirebaseToken, async (req, res) => {
 app.post('/retrieveAccountStatus', verifyFirebaseToken, async (req, res) => {
   try {
     const { accountId } = req.body;
-
     const account = await stripe.accounts.retrieve(accountId);
 
+    // Determine status: enabled means charges are fully active
+    let status = 'pending';
+    if (account.charges_enabled) {
+      status = 'enabled';
+    } else if (account.requirements?.currently_due?.length > 0) {
+      status = 'restricted';
+    }
+
     res.json({
-      status: account.charges_enabled ? 'enabled' : (account.requirements?.currently_due?.length > 0 ? 'restricted' : 'pending'),
+      status,
       chargesEnabled: account.charges_enabled,
       payoutsEnabled: account.payouts_enabled,
       detailsSubmitted: account.details_submitted,
@@ -122,29 +119,66 @@ app.post('/retrieveAccountStatus', verifyFirebaseToken, async (req, res) => {
 });
 
 // ============================================================
-// 4. Create PaymentIntent (for customer payment to connected account)
+// 4. Create PaymentIntent DIRECTLY ON the business's Stripe account
+//
+//    KEY CHANGE from old code:
+//    ❌ Old: stripe.paymentIntents.create({ transfer_data: { destination: bizAcctId } })
+//            This charged your platform account and transferred — needs platform Stripe account.
+//    ✅ New: stripe.paymentIntents.create(data, { stripeAccount: bizAcctId })
+//            This creates the PaymentIntent ON the business's own account directly.
+//            Money goes straight to them. No platform account needed.
 // ============================================================
 app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
   try {
     const { amount, currency, businessStripeAccountId, bookingId } = req.body;
 
+    if (!businessStripeAccountId) {
+      return res.status(400).json({
+        message: 'Business Stripe account ID is required. The business must complete Stripe onboarding first.',
+      });
+    }
+
+    // Validate the connected account exists and can accept payments
+    let connectedAccount;
+    try {
+      connectedAccount = await stripe.accounts.retrieve(businessStripeAccountId);
+    } catch (err) {
+      return res.status(400).json({
+        message: 'Invalid business Stripe account. Please ask the business to reconnect their Stripe account.',
+      });
+    }
+
+    if (!connectedAccount.charges_enabled) {
+      return res.status(400).json({
+        message: 'This business has not completed Stripe verification yet and cannot accept payments.',
+        detailsSubmitted: connectedAccount.details_submitted,
+        requirements: connectedAccount.requirements?.currently_due,
+      });
+    }
+
+    // ✅ THE DIRECT PAYMENT APPROACH:
+    // Pass { stripeAccount: businessStripeAccountId } as the second argument.
+    // This makes Stripe create the PaymentIntent on the BUSINESS's own account.
+    // The customer's money goes directly to the business — zero platform involvement.
     const paymentIntent = await stripe.paymentIntents.create(
       {
-        amount: amount,          // in cents
-        currency: currency,
+        amount: Math.round(amount), // must be integer (cents/paisa)
+        currency: currency.toLowerCase(),
         payment_method_types: ['card'],
-        transfer_data: {
-          destination: businessStripeAccountId,
-        },
-        // 🟢 No application_fee_amount – so 100% goes to the business
         metadata: {
-          bookingId: bookingId,
+          bookingId: bookingId || '',
+          businessAccountId: businessStripeAccountId,
+          createdBy: 'bookify_app',
         },
+        // No transfer_data, no application_fee_amount — payment is direct
       },
       {
+        // This header routes the API call to operate on the connected account
         stripeAccount: businessStripeAccountId,
       }
     );
+
+    console.log(`✅ PaymentIntent ${paymentIntent.id} created on account ${businessStripeAccountId}`);
 
     res.json({
       clientSecret: paymentIntent.client_secret,
@@ -152,36 +186,32 @@ app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
       status: paymentIntent.status,
       amount: paymentIntent.amount / 100,
       currency: paymentIntent.currency,
+      stripeAccountId: businessStripeAccountId, // Flutter needs this for the payment sheet
     });
   } catch (error) {
     console.error('Error creating PaymentIntent:', error);
-    if (
-      error.message &&
-      error.message.includes('transfer_data[destination]') &&
-      error.message.includes('your own account')
-    ) {
-      return res.status(400).json({
-        message:
-          'The business has not set up a separate Stripe account. Please contact the business owner to complete their Stripe onboarding.',
-      });
-    }
     res.status(500).json({ message: error.message });
   }
 });
 
 // ============================================================
-// 5. Retrieve PaymentIntent (optional)
+// 5. Retrieve PaymentIntent (verify payment after completion)
+//    Also needs stripeAccount header for direct account payments
 // ============================================================
-app.get('/retrievePaymentIntent', verifyFirebaseToken, async (req, res) => {
+app.post('/retrievePaymentIntent', verifyFirebaseToken, async (req, res) => {
   try {
-    const { paymentIntentId } = req.query;
+    const { paymentIntentId, businessStripeAccountId } = req.body;
 
-    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+    const paymentIntent = await stripe.paymentIntents.retrieve(
+      paymentIntentId,
+      { stripeAccount: businessStripeAccountId } // required for direct payments
+    );
 
     res.json({
       status: paymentIntent.status,
       amount: paymentIntent.amount / 100,
       currency: paymentIntent.currency,
+      metadata: paymentIntent.metadata,
     });
   } catch (error) {
     console.error('Error retrieving PaymentIntent:', error);
@@ -190,26 +220,46 @@ app.get('/retrievePaymentIntent', verifyFirebaseToken, async (req, res) => {
 });
 
 // ============================================================
-// 6. Webhook to listen for account updates (optional)
+// 6. Webhook — listens for account and payment updates
+//    For direct payments, events fire on the CONNECTED account,
+//    so you need to use the connected account's webhook secret.
 // ============================================================
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
 
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
   } catch (err) {
     console.log(`Webhook signature verification failed: ${err.message}`);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Handle the event
+  const connectedAccountId = req.headers['stripe-account']; // present for Connect events
+
   switch (event.type) {
-    case 'account.updated':
+    case 'account.updated': {
       const account = event.data.object;
       console.log(`Account ${account.id} updated. Charges enabled: ${account.charges_enabled}`);
-      // You can update Firestore here (e.g., set stripeAccountStatus)
+      // Optionally update Firestore stripeAccountStatus here
       break;
+    }
+    case 'payment_intent.succeeded': {
+      const pi = event.data.object;
+      const bookingId = pi.metadata?.bookingId;
+      console.log(`Payment succeeded for booking ${bookingId} on account ${connectedAccountId}`);
+      // Optionally update booking paymentStatus to 'paid' in Firestore here
+      break;
+    }
+    case 'payment_intent.payment_failed': {
+      const pi = event.data.object;
+      console.log(`Payment failed: ${pi.last_payment_error?.message}`);
+      break;
+    }
     default:
       console.log(`Unhandled event type ${event.type}`);
   }
@@ -217,24 +267,23 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   res.json({ received: true });
 });
 
-
-// Simple root route for health checks
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
-    message: 'Stripe Connect backend is running',
+    message: 'Stripe Direct Payment backend (no platform account)',
+    mode: 'direct_to_connected_account',
     endpoints: [
       'POST /createConnectedAccount',
       'POST /createAccountLink',
       'POST /retrieveAccountStatus',
-      'POST /createPaymentIntent',
-      'GET /retrievePaymentIntent',
-      'POST /webhook'
-    ]
+      'POST /createPaymentIntent  ← creates PaymentIntent on business own account',
+      'POST /retrievePaymentIntent',
+      'POST /webhook',
+    ],
   });
 });
-// Start server
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Stripe Connect backend running on port ${PORT}`);
+  console.log(`🚀 Stripe Direct Payment backend running on port ${PORT}`);
 });
