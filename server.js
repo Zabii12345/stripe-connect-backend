@@ -126,18 +126,20 @@ app.post('/retrieveAccountStatus', verifyFirebaseToken, async (req, res) => {
 // ============================================================
 app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
   try {
-    const { amount, currency, businessStripeAccountId, platformFee, bookingId } = req.body;
+    const { amount, currency, businessStripeAccountId, bookingId } = req.body;
 
-    // Create a PaymentIntent on the connected account
     const paymentIntent = await stripe.paymentIntents.create(
       {
-        amount: amount,          // in cents/paisa
+        amount: amount,          // in cents
         currency: currency,
         payment_method_types: ['card'],
         transfer_data: {
           destination: businessStripeAccountId,
         },
-        application_fee_amount: platformFee, // platform commission in cents
+        // 🟢 No application_fee_amount – so 100% goes to the business
+        metadata: {
+          bookingId: bookingId,
+        },
       },
       {
         stripeAccount: businessStripeAccountId,
@@ -153,8 +155,6 @@ app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating PaymentIntent:', error);
-
-    // Give a friendly error for "own account" issue
     if (
       error.message &&
       error.message.includes('transfer_data[destination]') &&
@@ -165,7 +165,6 @@ app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
           'The business has not set up a separate Stripe account. Please contact the business owner to complete their Stripe onboarding.',
       });
     }
-
     res.status(500).json({ message: error.message });
   }
 });
