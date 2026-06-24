@@ -40,16 +40,17 @@ async function verifyFirebaseToken(req, res, next) {
   }
 }
 
-// 1. Create Connected Account (Express) - ✅ FIXED: Dynamic country support
+// 1. Create Connected Account (Express) - ✅ FIXED: Use US for card payments
 app.post('/createConnectedAccount', verifyFirebaseToken, async (req, res) => {
   try {
-    const { businessId, email, country = 'PK' } = req.body; // ✅ Changed default to PK
+    const { businessId, email, country = 'US' } = req.body; // ✅ Use US for card payments
 
-    // ✅ Validate country is supported
-    const supportedCountries = ['US', 'PK', 'GB', 'CA', 'AU', 'IN', 'AE'];
+    // ✅ Only allow countries that support card_payments
+    const supportedCountries = ['US', 'GB', 'CA', 'AU', 'IE', 'NL', 'ES', 'IT', 'FR', 'DE'];
     if (!supportedCountries.includes(country)) {
       return res.status(400).json({
-        message: `Unsupported country: ${country}. Supported: ${supportedCountries.join(', ')}`
+        message: `Country ${country} does not support card payments directly. Please use US, UK, CA, AU, or EU countries.`,
+        supported: supportedCountries
       });
     }
 
@@ -63,9 +64,19 @@ app.post('/createConnectedAccount', verifyFirebaseToken, async (req, res) => {
       },
       business_type: 'individual',
       business_profile: {
-        mcc: '5734',
+        mcc: '5734', // Software publishing
         url: 'https://bookify.app',
       },
+      // ✅ Add cross-border payout settings for non-US businesses
+      ...(country !== 'US' && {
+        settings: {
+          payouts: {
+            schedule: {
+              interval: 'manual',
+            },
+          },
+        },
+      }),
     });
     console.log(`✅ Created Stripe account ${account.id} for business ${businessId} (${country})`);
     res.json({ accountId: account.id });
@@ -92,24 +103,21 @@ app.post('/createAccountLink', verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 3. Retrieve Account Status - ✅ FIXED: Returns real Stripe status (not custom status)
+// 3. Retrieve Account Status
 app.post('/retrieveAccountStatus', verifyFirebaseToken, async (req, res) => {
   try {
     const { accountId } = req.body;
     const account = await stripe.accounts.retrieve(accountId);
 
-    // ✅ Return actual Stripe data - client determines status based on flags
     res.json({
       chargesEnabled: account.charges_enabled,
       payoutsEnabled: account.payouts_enabled,
       detailsSubmitted: account.details_submitted,
       requirements: account.requirements,
       capabilities: account.capabilities,
-      // ✅ Additional useful data
       country: account.country,
       email: account.email,
       businessType: account.business_type,
-      // ✅ Compute proper status based on Stripe flags
       status: account.charges_enabled && account.payouts_enabled ? 'enabled'
               : (account.requirements?.currently_due?.length > 0 ? 'restricted' : 'pending'),
     });
@@ -119,7 +127,7 @@ app.post('/retrieveAccountStatus', verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 4. ✅ FIXED: Create PaymentIntent with proper Connect architecture
+// 4. Create PaymentIntent with proper Connect architecture
 app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
   try {
     const {
@@ -155,11 +163,9 @@ app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
       });
     }
 
-    // ✅ Option A: Destination charges (recommended) - Payment goes to platform, then transfers to connected account
-    // This is more reliable for onboarding verification
     const paymentIntent = await stripe.paymentIntents.create(
       {
-        amount: Math.round(amount), // Ensure integer
+        amount: Math.round(amount),
         currency: currency.toLowerCase(),
         payment_method_types: ['card'],
         application_fee_amount: Math.round(platformFee),
@@ -171,7 +177,6 @@ app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
           businessAccountId: businessStripeAccountId,
         },
       }
-      // ✅ REMOVED stripeAccount param - using transfer_data instead (destination charge)
     );
 
     res.json({
@@ -180,9 +185,7 @@ app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
       status: paymentIntent.status,
       amount: paymentIntent.amount / 100,
       currency: paymentIntent.currency,
-      // ✅ Send account ID for reference
       stripeAccountId: businessStripeAccountId,
-      // ✅ Send transfer info so client knows it's a destination charge
       isDestinationCharge: true,
     });
   } catch (error) {
@@ -195,7 +198,7 @@ app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 5. Retrieve PaymentIntent (optional)
+// 5. Retrieve PaymentIntent
 app.get('/retrievePaymentIntent', verifyFirebaseToken, async (req, res) => {
   try {
     const { paymentIntentId } = req.query;
@@ -217,7 +220,7 @@ app.get('/retrievePaymentIntent', verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 6. Webhook (optional)
+// 6. Webhook
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
