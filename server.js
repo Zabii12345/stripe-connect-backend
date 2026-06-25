@@ -4,7 +4,7 @@ const cors = require('cors');
 const Stripe = require('stripe');
 const admin = require('firebase-admin');
 
-// Initialize Firebase Admin SDK from Base64 environment variable
+// Firebase Admin SDK
 const serviceAccountBase64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
 if (!serviceAccountBase64) {
   console.error('❌ FIREBASE_SERVICE_ACCOUNT_BASE64 environment variable is missing');
@@ -23,7 +23,17 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Firebase Token Verification
+// ---- Fee configuration ----
+const PLATFORM_FEE_PERCENTAGE = parseFloat(process.env.PLATFORM_FEE_PERCENTAGE) || 0.0;
+const INCLUDE_STRIPE_FEE = process.env.INCLUDE_STRIPE_FEE !== 'false';
+const STRIPE_FEE_PERCENTAGE = 0.029;
+const STRIPE_FEE_FIXED_CENTS = 30; // $0.30 in cents
+const MINIMUM_CENTS = 50; // $0.50 minimum for US cards
+
+console.log(`⚙️  Platform fee percentage: ${PLATFORM_FEE_PERCENTAGE * 100}%`);
+console.log(`⚙️  Include Stripe fee: ${INCLUDE_STRIPE_FEE}`);
+
+// ---- Middleware ----
 async function verifyFirebaseToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -40,12 +50,12 @@ async function verifyFirebaseToken(req, res, next) {
   }
 }
 
-// 1. Create Connected Account (Express) - ✅ FIXED: Use US for card payments
+// ---- Endpoints ----
+
+// 1. Create Connected Account
 app.post('/createConnectedAccount', verifyFirebaseToken, async (req, res) => {
   try {
-    const { businessId, email, country = 'US' } = req.body; // ✅ Use US for card payments
-
-    // ✅ Only allow countries that support card_payments
+    const { businessId, email, country = 'US' } = req.body;
     const supportedCountries = ['US', 'GB', 'CA', 'AU', 'IE', 'NL', 'ES', 'IT', 'FR', 'DE'];
     if (!supportedCountries.includes(country)) {
       return res.status(400).json({
@@ -64,10 +74,9 @@ app.post('/createConnectedAccount', verifyFirebaseToken, async (req, res) => {
       },
       business_type: 'individual',
       business_profile: {
-        mcc: '5734', // Software publishing
+        mcc: '5734',
         url: 'https://bookify.app',
       },
-      // ✅ Add cross-border payout settings for non-US businesses
       ...(country !== 'US' && {
         settings: {
           payouts: {
@@ -86,7 +95,7 @@ app.post('/createConnectedAccount', verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 2. Create Account Link for Onboarding
+// 2. Create Account Link
 app.post('/createAccountLink', verifyFirebaseToken, async (req, res) => {
   try {
     const { accountId, returnUrl, refreshUrl } = req.body;
@@ -108,7 +117,6 @@ app.post('/retrieveAccountStatus', verifyFirebaseToken, async (req, res) => {
   try {
     const { accountId } = req.body;
     const account = await stripe.accounts.retrieve(accountId);
-
     res.json({
       chargesEnabled: account.charges_enabled,
       payoutsEnabled: account.payouts_enabled,
@@ -127,14 +135,14 @@ app.post('/retrieveAccountStatus', verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 4. Create PaymentIntent with proper Connect architecture
+// 4. Create PaymentIntent (UPDATED with fee calculation)
 app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
   try {
     const {
-      amount,
+      amount,                     // in cents, treated as desired net amount
       currency = 'usd',
       businessStripeAccountId,
-      platformFee = 0,
+      platformFee = 0,            // optional override
       bookingId
     } = req.body;
 
@@ -146,7 +154,7 @@ app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
       return res.status(400).json({ message: 'Business Stripe account ID is required' });
     }
 
-    // ✅ Verify account exists and can accept payments
+    // Verify account
     try {
       const account = await stripe.accounts.retrieve(businessStripeAccountId);
       if (!account.charges_enabled) {
@@ -163,18 +171,47 @@ app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
       });
     }
 
+    // ---- Fee calculation ----
+    const desiredAmountCents = amount; // already in cents
+
+    // 1. Platform fee (if any)
+    let platformFeeCents = Math.round(desiredAmountCents * PLATFORM_FEE_PERCENTAGE);
+    if (platformFee > 0) {
+      platformFeeCents = Math.round(platformFee);
+    }
+
+    // 2. Total to charge
+    let totalCents = desiredAmountCents + platformFeeCents;
+
+    // 3. Include Stripe processing fee (2.9% + $0.30) on top
+    if (INCLUDE_STRIPE_FEE) {
+      const numerator = desiredAmountCents + platformFeeCents + STRIPE_FEE_FIXED_CENTS;
+      totalCents = Math.round(numerator / (1 - STRIPE_FEE_PERCENTAGE));
+    }
+
+    // Ensure minimum
+    if (totalCents < MINIMUM_CENTS) {
+      return res.status(400).json({
+        message: `Total amount must be at least $${(MINIMUM_CENTS / 100).toFixed(2)} USD. Your desired net amount is too low.`
+      });
+    }
+
+    // Create PaymentIntent
     const paymentIntent = await stripe.paymentIntents.create(
       {
-        amount: Math.round(amount),
+        amount: totalCents,
         currency: currency.toLowerCase(),
         payment_method_types: ['card'],
-        application_fee_amount: Math.round(platformFee),
+        application_fee_amount: platformFeeCents,
         transfer_data: {
           destination: businessStripeAccountId,
         },
         metadata: {
           bookingId: bookingId || '',
           businessAccountId: businessStripeAccountId,
+          desiredNetAmount: desiredAmountCents.toString(),
+          platformFee: platformFeeCents.toString(),
+          includeStripeFee: INCLUDE_STRIPE_FEE ? 'true' : 'false',
         },
       }
     );
@@ -187,6 +224,13 @@ app.post('/createPaymentIntent', verifyFirebaseToken, async (req, res) => {
       currency: paymentIntent.currency,
       stripeAccountId: businessStripeAccountId,
       isDestinationCharge: true,
+      // Optional breakdown for debugging
+      breakdown: {
+        desiredNet: desiredAmountCents / 100,
+        platformFee: platformFeeCents / 100,
+        stripeFee: (totalCents - desiredAmountCents - platformFeeCents) / 100,
+        total: totalCents / 100,
+      },
     });
   } catch (error) {
     console.error('Error creating PaymentIntent:', error);
@@ -257,7 +301,14 @@ app.get('/', (req, res) => {
       'POST /createPaymentIntent',
       'GET /retrievePaymentIntent',
       'POST /webhook'
-    ]
+    ],
+    config: {
+      platformFeePercentage: PLATFORM_FEE_PERCENTAGE * 100 + '%',
+      includeStripeFee: INCLUDE_STRIPE_FEE,
+      stripeFeePercentage: STRIPE_FEE_PERCENTAGE * 100 + '%',
+      stripeFeeFixed: '$' + (STRIPE_FEE_FIXED_CENTS / 100).toFixed(2),
+      minimumAmount: '$' + (MINIMUM_CENTS / 100).toFixed(2),
+    }
   });
 });
 
