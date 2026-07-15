@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const admin = require('firebase-admin');
+const axios = require('axios');
 
 // Firebase Admin SDK
 const serviceAccountBase64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
@@ -32,6 +33,14 @@ const MINIMUM_CENTS = 50; // $0.50 minimum for US cards
 
 console.log(`⚙️  Platform fee percentage: ${PLATFORM_FEE_PERCENTAGE * 100}%`);
 console.log(`⚙️  Include Stripe fee: ${INCLUDE_STRIPE_FEE}`);
+
+// ---- Email (Brevo) configuration ----
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const BREVO_FROM_EMAIL = process.env.BREVO_FROM_EMAIL || 'bookifyapp.org@gmail.com';
+const BREVO_FROM_NAME = process.env.BREVO_FROM_NAME || 'Bookify';
+if (!BREVO_API_KEY) {
+  console.warn('⚠️  BREVO_API_KEY is not set — /send-email will fail until it is configured');
+}
 
 // ---- Middleware ----
 async function verifyFirebaseToken(req, res, next) {
@@ -264,7 +273,47 @@ app.get('/retrievePaymentIntent', verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 6. Webhook
+// 6. Send Email (via Brevo) — keeps the Brevo API key server-side only
+app.post('/send-email', verifyFirebaseToken, async (req, res) => {
+  try {
+    const { to, name, subject, html, htmlContent } = req.body;
+    const body = html || htmlContent;
+
+    if (!to || !subject || !body) {
+      return res.status(400).json({ error: 'to, subject, and html are required' });
+    }
+
+    if (!BREVO_API_KEY) {
+      console.error('BREVO_API_KEY is not configured on the server');
+      return res.status(500).json({ error: 'Email service is not configured' });
+    }
+
+    await axios.post(
+      'https://api.brevo.com/v3/smtp/email',
+      {
+        sender: { name: BREVO_FROM_NAME, email: BREVO_FROM_EMAIL },
+        to: [{ email: to, name: name || undefined }],
+        subject,
+        htmlContent: body,
+      },
+      {
+        headers: {
+          'api-key': BREVO_API_KEY,
+          'content-type': 'application/json',
+          accept: 'application/json',
+        },
+      }
+    );
+
+    console.log(`✅ Email sent to ${to} (requested by uid: ${req.user.uid})`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error sending email:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to send email' });
+  }
+});
+
+// 7. Webhook
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -300,6 +349,7 @@ app.get('/', (req, res) => {
       'POST /retrieveAccountStatus',
       'POST /createPaymentIntent',
       'GET /retrievePaymentIntent',
+      'POST /send-email',
       'POST /webhook'
     ],
     config: {
